@@ -36,39 +36,41 @@ jobs:
         if: steps.check.outputs.exists == 'false'
         run: |
           set -e
-          pip install onnx==1.17.0 onnxruntime==1.17.1 sherpa-onnx numpy
+          pip install onnx onnxruntime sherpa-onnx numpy
           mkdir -p work && cd work
-          HF=https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK
-          for v in fasih aegis_female; do
-            curl -fL -o ur_PK-$v-medium.onnx      "$HF/$v/medium/ur_PK-$v-medium.onnx"
-            curl -fL -o ur_PK-$v-medium.onnx.json "$HF/$v/medium/ur_PK-$v-medium.onnx.json"
-          done
-          curl -fL -o espeak-ng-data.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/espeak-ng-data.tar.bz2
-          tar xjf espeak-ng-data.tar.bz2
+          # Male: official sherpa-onnx package of rhasspy ur_PK-fasih-medium (already converted, incl. espeak-ng-data)
+          curl -fL -o fasih.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-ur_PK-fasih-medium.tar.bz2
+          tar xjf fasih.tar.bz2
+          ls -la vits-piper-ur_PK-fasih-medium
+          OFF=vits-piper-ur_PK-fasih-medium
+          mkdir -p ur_PK-fasih-medium
+          cp $OFF/ur_PK-fasih-medium.onnx ur_PK-fasih-medium/model.onnx
+          cp $OFF/tokens.txt ur_PK-fasih-medium/tokens.txt
+          cp -r $OFF/espeak-ng-data .
+          # Female: rhasspy ur_PK-aegis_female-medium (MIT), converted using the official model's metadata as template
+          HF=https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium
+          curl -fL -o ur_PK-aegis_female-medium.onnx      "$HF/ur_PK-aegis_female-medium.onnx"
+          curl -fL -o ur_PK-aegis_female-medium.onnx.json "$HF/ur_PK-aegis_female-medium.onnx.json"
           cat > convert.py <<'PY'
-          # Same steps as the official sherpa-onnx piper.py: tokens.txt + ONNX metadata.
           import json, os, sys, onnx
-          name = sys.argv[1]
+          name, template = sys.argv[1], sys.argv[2]
           cfg = json.load(open(name + ".onnx.json", encoding="utf-8"))
           os.makedirs(name, exist_ok=True)
           with open(os.path.join(name, "tokens.txt"), "w", encoding="utf-8") as f:
               for s, i in cfg["phoneme_id_map"].items():
                   f.write(f"{s} {i[0]}\n")
+          meta = {p.key: p.value for p in onnx.load(template, load_external_data=False).metadata_props}
+          print("template metadata:", meta)
+          meta["sample_rate"] = str(cfg["audio"]["sample_rate"])
+          meta["n_speakers"] = str(cfg.get("num_speakers", 1))
+          meta["voice"] = cfg.get("espeak", {}).get("voice", meta.get("voice", "ur"))
           model = onnx.load(name + ".onnx")
           while len(model.metadata_props):
               model.metadata_props.pop()
-          meta = {
-              "model_type": "vits", "comment": "piper",
-              "language": cfg.get("language", {}).get("name_english", "Urdu"),
-              "voice": cfg.get("espeak", {}).get("voice", "ur"),
-              "has_espeak": 1,
-              "n_speakers": cfg.get("num_speakers", 1),
-              "sample_rate": cfg["audio"]["sample_rate"],
-          }
           for k, v in meta.items():
-              p = model.metadata_props.add(); p.key = k; p.value = str(v)
+              p = model.metadata_props.add(); p.key = k; p.value = v
           onnx.save(model, os.path.join(name, "model.onnx"))
-          print(name, meta)
+          print(name, "metadata:", meta)
           PY
           cat > test.py <<'PY'
           import sys, wave, numpy as np, sherpa_onnx
@@ -77,7 +79,7 @@ jobs:
               model=sherpa_onnx.OfflineTtsModelConfig(
                   vits=sherpa_onnx.OfflineTtsVitsModelConfig(
                       model=f"{name}/model.onnx", lexicon="", tokens=f"{name}/tokens.txt", data_dir="espeak-ng-data"),
-                  num_threads=2, debug=False, provider="cpu"),
+                  num_threads=2, debug=True, provider="cpu"),
               max_num_sentences=1)
           assert cfg.validate(), "invalid config"
           tts = sherpa_onnx.OfflineTts(cfg)
@@ -92,14 +94,21 @@ jobs:
               w.setnchannels(1); w.setsampwidth(2); w.setframerate(a.sample_rate)
               w.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
           PY
-          for v in fasih aegis_female; do
-            n=ur_PK-$v-medium
-            python convert.py $n
-            python test.py $n
-            (cd $n && zip -q ../$n.zip model.onnx tokens.txt)
+          python convert.py ur_PK-aegis_female-medium $OFF/ur_PK-fasih-medium.onnx || echo "::error::female conversion failed"
+          ok=0
+          : > assets.txt
+          for n in ur_PK-fasih-medium ur_PK-aegis_female-medium; do
+            if [ -f $n/model.onnx ] && python test.py $n; then
+              (cd $n && zip -q ../$n.zip model.onnx tokens.txt)
+              echo "$n.zip sample-$n.wav" >> assets.txt
+              ok=$((ok+1))
+            else
+              echo "::error::Voice $n did not pass the Urdu speech test - not published"
+            fi
           done
           zip -qr espeak-ng-data.zip espeak-ng-data
-          ls -la *.zip *.wav
+          echo "voices passed: $ok"
+          [ "$ok" -ge 1 ]
 
       - name: Publish voices
         if: steps.check.outputs.exists == 'false'
@@ -107,9 +116,8 @@ jobs:
           cd work
           gh release create voices-v1 --repo "$GITHUB_REPOSITORY" \
             --title "HAJI APP offline Urdu voices (Piper, MIT)" \
-            --notes "Converted from rhasspy/piper-voices (MIT) for sherpa-onnx and tested in CI. Samples included." \
-            ur_PK-fasih-medium.zip ur_PK-aegis_female-medium.zip espeak-ng-data.zip \
-            sample-ur_PK-fasih-medium.wav sample-ur_PK-aegis_female-medium.wav
+            --notes "rhasspy/piper-voices (MIT) prepared for sherpa-onnx; each voice passed an Urdu speech test in CI. Samples included." \
+            espeak-ng-data.zip $(cat assets.txt)
 
   # ------------------------------------------------------------------
   # 2) Build the app
