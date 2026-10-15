@@ -18,10 +18,12 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Check if voices are already published
+      - name: Check which voices are already published
         id: check
         run: |
-          if gh release view voices-v1 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          names=$(gh release view voices-v1 --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null || true)
+          echo "$names"
+          if echo "$names" | grep -q "ur_PK-aegis_female-medium.zip" && echo "$names" | grep -q "ur_PK-fasih-medium.zip"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -58,7 +60,7 @@ jobs:
           os.makedirs(name, exist_ok=True)
           with open(os.path.join(name, "tokens.txt"), "w", encoding="utf-8") as f:
               for s, i in cfg["phoneme_id_map"].items():
-                  f.write(f"{s} {i[0]}\n")
+                  f.write(f"{s} {i[0] if isinstance(i, list) else i}\n")
           meta = {p.key: p.value for p in onnx.load(template, load_external_data=False).metadata_props}
           print("template metadata:", meta)
           meta["sample_rate"] = str(cfg["audio"]["sample_rate"])
@@ -114,10 +116,14 @@ jobs:
         if: steps.check.outputs.exists == 'false'
         run: |
           cd work
-          gh release create voices-v1 --repo "$GITHUB_REPOSITORY" \
-            --title "HAJI APP offline Urdu voices (Piper, MIT)" \
-            --notes "rhasspy/piper-voices (MIT) prepared for sherpa-onnx; each voice passed an Urdu speech test in CI. Samples included." \
-            espeak-ng-data.zip $(cat assets.txt)
+          if gh release view voices-v1 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload voices-v1 --repo "$GITHUB_REPOSITORY" --clobber espeak-ng-data.zip $(cat assets.txt)
+          else
+            gh release create voices-v1 --repo "$GITHUB_REPOSITORY" \
+              --title "HAJI APP offline Urdu voices (Piper, MIT)" \
+              --notes "rhasspy/piper-voices (MIT) prepared for sherpa-onnx; each voice passed an Urdu speech test in CI. Samples included." \
+              espeak-ng-data.zip $(cat assets.txt)
+          fi
 
   # ------------------------------------------------------------------
   # 2) Build the app
@@ -167,7 +173,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: HAJI APP 3.0 build ${{ github.run_number }}
+          name: HAJI APP 3.1 build ${{ github.run_number }}
           body: |
             Most phones: HAJI-APP-arm64.apk
             Older/cheaper phones (32-bit): HAJI-APP-armv7.apk
